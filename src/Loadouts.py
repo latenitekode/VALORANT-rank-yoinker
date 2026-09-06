@@ -15,29 +15,37 @@ class Loadouts:
         self.current_map = current_map
         self._api_cache = {}
         self._api_lock = threading.RLock()
+        self._api_key_locks = {}
         self._prime_thread = None
 
     def _api_get(self, key, url):
         with self._api_lock:
             cached = self._api_cache.get(key)
+            key_lock = self._api_key_locks.setdefault(key, threading.Lock())
         if cached is not None:
             return cached
-        try:
-            response = requests.get(url, timeout=(2.5, 8.0))
-            response.raise_for_status()
-        except Exception as exc:
-            self.log(f"loadout metadata fetch failed for {key}: {exc}")
+
+        with key_lock:
             with self._api_lock:
                 cached = self._api_cache.get(key)
             if cached is not None:
                 return cached
-            fallback = requests.Response()
-            fallback.status_code = 200
-            fallback._content = b'{"data": []}'
-            return fallback
-        with self._api_lock:
-            self._api_cache[key] = response
-        return response
+            try:
+                response = requests.get(url, timeout=(2.0, 5.0))
+                response.raise_for_status()
+            except Exception as exc:
+                self.log(f"loadout metadata fetch failed for {key}: {exc}")
+                with self._api_lock:
+                    cached = self._api_cache.get(key)
+                if cached is not None:
+                    return cached
+                fallback = requests.Response()
+                fallback.status_code = 200
+                fallback._content = b'{"data": []}'
+                return fallback
+            with self._api_lock:
+                self._api_cache[key] = response
+            return response
 
     def prime_metadata_async(self):
         """Warm static valorant-api metadata in the background while VRY is in menus."""
@@ -45,6 +53,7 @@ class Loadouts:
             return
         urls = {
             "weapons": "https://valorant-api.com/v1/weapons",
+            "skins": "https://valorant-api.com/v1/weapons/skins",
             "sprays": "https://valorant-api.com/v1/sprays",
             "flex": "https://valorant-api.com/v1/flex",
             "buddies": "https://valorant-api.com/v1/buddies",
@@ -68,7 +77,13 @@ class Loadouts:
             rows = (players.get("AllyTeam") or {}).get("Players", [])
         else:
             rows = players if isinstance(players, list) else []
-        return {"Players": {p.get("Subject"): {} for p in rows if p.get("Subject")}, "time": int(time.time())}
+        return {
+            "Players": {p.get("Subject"): {} for p in rows if p.get("Subject")},
+            "time": int(time.time()),
+        }
+
+    def get_skin_metadata(self):
+        return self._api_get("skins", "https://valorant-api.com/v1/weapons/skins")
 
     def get_match_loadouts(self, match_id, players, weaponChoose, valoApiSkins, names, state="game"):
         weaponLists = {}

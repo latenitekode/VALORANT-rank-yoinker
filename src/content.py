@@ -6,6 +6,13 @@ class Content():
         self.log = log
         self.content = {}
 
+    def _valorant_api_json(self, endpoint):
+        response = requests.get(
+            f"https://valorant-api.com/v1/{endpoint}", timeout=(2.5, 7.0)
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_content(self):
         self.content = self.Requests.fetch("custom", f"https://shared.{self.Requests.region}.a.pvp.net/content-service/v3/content", "get")
         return self.content
@@ -29,7 +36,7 @@ class Content():
         return None
 
     def get_all_agents(self):
-        rAgents = requests.get("https://valorant-api.com/v1/agents?isPlayableCharacter=true").json()
+        rAgents = self._valorant_api_json("agents?isPlayableCharacter=true")
         agent_dict = {}
         agent_dict.update({None: None})
         agent_dict.update({"": ""})
@@ -43,7 +50,7 @@ class Content():
         Requests data and assets of all maps.
         :return: JSON of all map information.
         """
-        return requests.get("https://valorant-api.com/v1/maps").json()
+        return self._valorant_api_json("maps")
 
     def get_map_urls(self, maps) -> dict:
         map_dict = {}

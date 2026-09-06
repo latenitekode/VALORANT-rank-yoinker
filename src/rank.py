@@ -1,3 +1,4 @@
+import threading
 
 class Rank:
     def __init__(self, Requests, log, content, ranks_before):
@@ -6,17 +7,22 @@ class Rank:
         self.ranks_before = ranks_before
         self.content = content
         self.requestMap = {}
+        self._request_lock = threading.RLock()
 
     def get_request(self, puuid):
-        if puuid in self.requestMap:
-            return self.requestMap[puuid]
+        with self._request_lock:
+            cached = self.requestMap.get(puuid)
+        if cached is not None:
+            return cached
 
         response = self.Requests.fetch('pd', f"/mmr/v1/players/{puuid}", "get")
-        self.requestMap[puuid] = response
-        return response
+        with self._request_lock:
+            # If another worker won the race, reuse its response.
+            return self.requestMap.setdefault(puuid, response)
 
     def invalidate_cached_responses(self):
-        self.requestMap = {}
+        with self._request_lock:
+            self.requestMap.clear()
 
     #in future rewrite this code
     def get_rank(self, puuid, seasonID):
@@ -63,7 +69,8 @@ class Rank:
 
             else:
                 self.log("failed getting rank")
-                self.log(response.text)
+                if response is not None:
+                    self.log(response.text)
                 final["rank"] = 0
                 final["rr"] = 0
                 final["leaderboard"] = 0

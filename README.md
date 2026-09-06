@@ -17,6 +17,10 @@
   </ol>
 
 
+## Fork reliability notes
+
+This fork preserves the upstream VRY interface while hardening the live-state/request backbone. See [`FORK-NOTES.md`](FORK-NOTES.md) for the exact reliability and packaging changes. Upstream ISC authorship and license are preserved.
+
 ## About The Project
 
 ![Screenshot](assets/Example.png)
@@ -33,14 +37,14 @@
 ### Bundled Release:
 
 1) Download [Microsoft Visual C++ Libraries](https://github.com/abbodi1406/vcredist/releases)
-2) Download the [release](https://github.com/mdevio/valorant-rank-yoinker/releases/latest).
+2) Download the [release](https://github.com/latenitekode/VALORANT-rank-yoinker/releases/latest).
 3) Extract **all** files.
 4) Run vRY.exe.
 
 ### Running from source:
 
-1) Download Python [3.14.5](https://www.python.org/downloads/release/python-3145/) (recommended), [3.11](https://www.python.org/downloads/release/python-3119/) or [3.10](https://www.python.org/downloads/release/python-31011/), and make sure it is added to your PATH. (This is an option during installation.)
-2) Download the [source](https://github.com/mdevio/VALORANT-rank-yoinker/archive/refs/heads/main.zip).
+1) Download Python [3.14.5](https://www.python.org/downloads/release/python-3145/) (recommended; source/developer path) and make sure it is added to your PATH. (This is an option during installation.)
+2) Download the [source](https://github.com/latenitekode/VALORANT-rank-yoinker/archive/refs/heads/main.zip).
 3) Run **`INSTALL.bat`** file (or use `pip install -r requirements.txt` in the terminal)
 4) Run **`START.bat`** file (or use `python main.py` in the terminal)
 
@@ -57,13 +61,13 @@
 
 ### Letting Github Build It:
 
-The latest commits to the `main` branch will be built by a [Github Actions](https://github.com/mdevio/VALORANT-rank-yoinker/actions) workflow
+The latest commits to the `main` branch will be built by a [Github Actions](https://github.com/latenitekode/VALORANT-rank-yoinker/actions) workflow
 and a successful build should result in a compiled artifact that you can download and try out.
-See the [Actions tab](https://github.com/mdevio/VALORANT-rank-yoinker/actions), click on the `Build` workflow,
+See the [Actions tab](https://github.com/latenitekode/VALORANT-rank-yoinker/actions), click on the `Build` workflow,
 select a particular workflow run, and it should have an artifact available for download.
 
 If you want to make a small change to the application, you can:
-1) [Fork](https://github.com/mdevio/VALORANT-rank-yoinker/fork) this project.
+1) [Fork](https://github.com/latenitekode/VALORANT-rank-yoinker/fork) this project.
 2) Change the code in your forked repository.
 3) Let the Github Actions workflow build vRY.exe for you.
 4) Download it and test it.
@@ -101,5 +105,5 @@ Whilst effort has been made to abide by Riot's API rules; you acknowledge that u
 [discord-url]: https://discord.gg/HeTKed64Ka
 [discord-banner]: https://discordapp.com/api/guilds/872101595037446144/widget.png?style=banner2
 
-[downloads-shield]: https://img.shields.io/github/downloads/mdevio/VALORANT-rank-yoinker/total?style=for-the-badge&logo=github
-[downloads-url]: https://github.com/mdevio/VALORANT-rank-yoinker/releases/latest
+[downloads-shield]: https://img.shields.io/github/downloads/latenitekode/VALORANT-rank-yoinker/total?style=for-the-badge&logo=github
+[downloads-url]: https://github.com/latenitekode/VALORANT-rank-yoinker/releases/latest

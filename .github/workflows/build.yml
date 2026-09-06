@@ -1,53 +1,88 @@
 name: Build
 
 env:
-  PYTHON_VERSION: '3.10'
+  PYTHON_VERSION: '3.14.5'
+  PYTHON_BUILD_VERSION: '3.14'
 
 on:
   push:
     branches:
       - 'main'
-    
+      - 'vry-statix-final'
   pull_request:
-    types: [review_requested]
+    branches:
+      - 'main'
+  workflow_dispatch:
 
 jobs:
-  specific_review_requested:
-    
-    runs-on: windows-latest
-    steps: 
-      - run: echo 'A review was requested from the devs'
-      
   build:
-  
     runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: 'requirements.txt'
-            
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
+      - name: Run live-backbone regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Install cx_Freeze
         run: pip install cx_Freeze
-      
-      - name: Build Native Executable
+
+      - name: Build native executable
         run: python setup.py build
-      
-      - name: Get commit hash
+
+      - name: Copy docs into build output
+        shell: pwsh
+        run: |
+          Copy-Item -Path "docs" -Destination "build/exe.win-amd64-${{ env.PYTHON_BUILD_VERSION }}/docs" -Recurse -Force
+
+      - name: Verify frozen release layout
+        shell: pwsh
+        run: |
+          $root = "build/exe.win-amd64-${{ env.PYTHON_BUILD_VERSION }}"
+          $required = @(
+            "$root/vry.exe",
+            "$root/python314.dll",
+            "$root/lib",
+            "$root/docs",
+            "$root/configurator.bat",
+            "$root/updatescript.bat"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Missing required release item: $path"
+            }
+          }
+
+      - name: Get short commit hash
         id: commit
-        uses: pr-mpt/actions-commit-hash@v1
-      
-      - name: Upload Compiled Version
+        shell: pwsh
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $short = $env:COMMIT_SHA.Substring(0, 7)
+          "short=$short" >> $env:GITHUB_OUTPUT
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          python --version
+          Get-ChildItem "build/exe.win-amd64-${{ env.PYTHON_BUILD_VERSION }}" -Recurse
+
+      - name: Upload compiled Windows release
         uses: actions/upload-artifact@v4
         with:
           name: VALORANT-rank-yoinker-${{ steps.commit.outputs.short }}
-          path: build/exe.win-amd64-${{ env.PYTHON_VERSION }}/**
+          path: build/exe.win-amd64-${{ env.PYTHON_BUILD_VERSION }}/**
+          if-no-files-found: error

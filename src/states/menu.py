@@ -4,92 +4,82 @@ class Menu:
         self.log = log
         self.presences = presences
 
+    @staticmethod
+    def _party_fields(decoded_presence):
+        if not isinstance(decoded_presence, dict):
+            return "", 0, 0
+        party = decoded_presence.get("partyPresenceData")
+        player = decoded_presence.get("playerPresenceData")
+        if isinstance(party, dict):
+            return (
+                party.get("partyId", ""),
+                party.get("partySize", 0) or 0,
+                (player or {}).get("accountLevel", 0) if isinstance(player, dict) else 0,
+            )
+        return (
+            decoded_presence.get("partyId", ""),
+            decoded_presence.get("partySize", 0) or 0,
+            decoded_presence.get("accountLevel", 0) or 0,
+        )
+
     def get_party_json(self, GamePlayersPuuid, presencesDICT):
         party_json = {}
-        for presence in presencesDICT:
-            if presence["puuid"] in GamePlayersPuuid:
-                decodedPresence = self.presences.decode_presence(presence["private"])
-                if decodedPresence["isValid"]:
-                    
-                    # Temp fix: Riot is swapping between nested and flat API structures.
-                    party_size = 0
-                    party_id = ""
-                    if "partyPresenceData" in decodedPresence: # Check for nested structure
-                        party_size = decodedPresence["partyPresenceData"]["partySize"]
-                        party_id = decodedPresence["partyPresenceData"]["partyId"]
-                    elif "partySize" in decodedPresence: # Check for flattened structure
-                        party_size = decodedPresence["partySize"]
-                        party_id = decodedPresence["partyId"]
-                    else:
-                        # No known structure found, log and fail
-                        self.log("ERROR: Unknown presence API structure in 'get_party_json'.")
-                        party_id = decodedPresence["partyPresenceData"]["partyId"]
+        game_players = set(GamePlayersPuuid or [])
+        for presence in presencesDICT or []:
+            if presence.get("puuid") not in game_players:
+                continue
+            decoded = self.presences.decode_presence(presence.get("private"))
+            if not decoded.get("isValid"):
+                continue
+            party_id, party_size, _ = self._party_fields(decoded)
+            if party_id and party_size > 1:
+                party_json.setdefault(party_id, []).append(presence.get("puuid"))
 
-                    if party_size > 1:
-                        try:
-                            party_json[party_id].append(presence["puuid"])
-                        except KeyError:
-                            party_json.update({party_id: [presence["puuid"]]})
-
-        #remove non-in-game parties from with one player in game
-        parties_to_delete = []
-        for party in party_json:
-            if len(party_json[party]) == 1:
-                parties_to_delete.append(party)
-        for party in parties_to_delete:
-            del party_json[party]
-
+        # Remove parties for which only one in-match player is currently visible.
+        party_json = {
+            party_id: members
+            for party_id, members in party_json.items()
+            if len(members) > 1
+        }
         self.log(f"retrieved party json: {party_json}")
         return party_json
 
     def get_party_members(self, self_puuid, presencesDICT):
-        res = []
-        party_id = ""
-        
-        for presence in presencesDICT:
-            if presence["puuid"] == self_puuid:
-                decodedPresence = self.presences.decode_presence(presence["private"])
-                if decodedPresence["isValid"]:
-                    
-                    # Temp fix: Riot is swapping between nested and flat API structures.
-                    account_level = 0
-                    if "partyPresenceData" in decodedPresence: # Check for nested structure
-                        party_id = decodedPresence["partyPresenceData"]["partyId"]
-                        account_level = decodedPresence["playerPresenceData"]["accountLevel"]
-                    elif "partyId" in decodedPresence: # Check for flattened structure
-                        party_id = decodedPresence["partyId"]
-                        account_level = decodedPresence["accountLevel"]
-                    else:
-                        # No known structure found, log and fail
-                        self.log("ERROR: Unknown presence API structure in 'get_party_members' (self).")
-                        party_id = decodedPresence["partyPresenceData"]["partyId"]
-                        
-                    res.append({"Subject": presence["puuid"], "PlayerIdentity": {"AccountLevel": account_level}})
-        
-        # Find other party members
-        for presence in presencesDICT:
-            if presence["puuid"] == self_puuid:
-                continue # Skip self
-                
-            decodedPresence = self.presences.decode_presence(presence["private"])
-            if decodedPresence["isValid"]:
-                
-                # Temp fix: Riot is swapping between nested and flat API structures.
-                current_party_id = ""
-                account_level = 0
-                if "partyPresenceData" in decodedPresence: # Check for nested structure
-                    current_party_id = decodedPresence["partyPresenceData"]["partyId"]
-                    account_level = decodedPresence["playerPresenceData"]["accountLevel"]
-                elif "partyId" in decodedPresence: # Check for flattened structure
-                    current_party_id = decodedPresence["partyId"]
-                    account_level = decodedPresence["accountLevel"]
-                else:
-                    # No known structure found, log and fail
-                    self.log("ERROR: Unknown presence API structure in 'get_party_members'.")
-                    current_party_id = decodedPresence["partyPresenceData"]["partyId"]
+        rows = list(presencesDICT or [])
+        result = []
+        own_party_id = ""
 
-                if current_party_id == party_id:
-                    res.append({"Subject": presence["puuid"], "PlayerIdentity": {"AccountLevel": account_level}})
-                    
-        self.log(f"retrieved party members: {res}")
-        return res
+        for presence in rows:
+            if presence.get("puuid") != self_puuid:
+                continue
+            decoded = self.presences.decode_presence(presence.get("private"))
+            if not decoded.get("isValid"):
+                continue
+            own_party_id, _, account_level = self._party_fields(decoded)
+            result.append(
+                {
+                    "Subject": presence.get("puuid"),
+                    "PlayerIdentity": {"AccountLevel": account_level},
+                }
+            )
+            break
+
+        if own_party_id:
+            for presence in rows:
+                puuid = presence.get("puuid")
+                if not puuid or puuid == self_puuid:
+                    continue
+                decoded = self.presences.decode_presence(presence.get("private"))
+                if not decoded.get("isValid"):
+                    continue
+                party_id, _, account_level = self._party_fields(decoded)
+                if party_id == own_party_id:
+                    result.append(
+                        {
+                            "Subject": puuid,
+                            "PlayerIdentity": {"AccountLevel": account_level},
+                        }
+                    )
+
+        self.log(f"retrieved party members: {result}")
+        return result

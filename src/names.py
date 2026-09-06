@@ -1,57 +1,52 @@
-import requests
-
-
 class Names:
-
     def __init__(self, Requests, log):
         self.Requests = Requests
         self.log = log
 
+    @staticmethod
+    def _display_name(row):
+        if not isinstance(row, dict):
+            return "#"
+        game_name = row.get("GameName", "")
+        tag_line = row.get("TagLine", "")
+        return f"{game_name}#{tag_line}" if game_name or tag_line else "#"
+
     def get_name_from_puuid(self, puuid):
         try:
-            response = requests.put(
-                self.Requests.pd_url + "/name-service/v2/players",
-                headers=self.Requests.get_headers(),
-                json=[puuid],
-                verify=False,
-                timeout=(2.5, 6.0),
+            response = self.Requests.fetch(
+                "pd",
+                "/name-service/v2/players",
+                "put",
+                json_body=[puuid],
             )
-            data = response.json()
-            if data and isinstance(data, list):
-                return data[0].get("GameName", "") + "#" + data[0].get("TagLine", "")
+            if response is not None and response.ok:
+                data = response.json()
+                if isinstance(data, list) and data:
+                    return self._display_name(data[0])
         except Exception as exc:
             self.log(f"name lookup failed for {puuid}: {exc}")
         return "#"
 
     def get_multiple_names_from_puuid(self, puuids):
-        puuids = [x for x in puuids if x]
+        puuids = list(dict.fromkeys(x for x in puuids if x))
         fallback = {puuid: "#" for puuid in puuids}
         if not puuids:
             return fallback
         try:
-            response = requests.put(
-                self.Requests.pd_url + "/name-service/v2/players",
-                headers=self.Requests.get_headers(),
-                json=puuids,
-                verify=False,
-                timeout=(2.5, 6.0),
+            response = self.Requests.fetch(
+                "pd",
+                "/name-service/v2/players",
+                "put",
+                json_body=puuids,
             )
+            if response is None or not response.ok:
+                return fallback
             data = response.json()
-            if isinstance(data, dict) and data.get("errorCode"):
-                self.log(f'{data.get("errorCode")}, new token retrieved')
-                response = requests.put(
-                    self.Requests.pd_url + "/name-service/v2/players",
-                    headers=self.Requests.get_headers(refresh=True),
-                    json=puuids,
-                    verify=False,
-                    timeout=(2.5, 6.0),
-                )
-                data = response.json()
             if isinstance(data, list):
                 for player in data:
                     subject = player.get("Subject")
                     if subject:
-                        fallback[subject] = f"{player.get('GameName', '')}#{player.get('TagLine', '')}"
+                        fallback[subject] = self._display_name(player)
         except Exception as exc:
             # Names are useful but not authoritative for whether the live scoreboard
             # exists. Keep the table moving and let streamer/agent fallback text work.

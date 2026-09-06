@@ -36,8 +36,10 @@ class Ws:
         for presence in rows or []:
             if presence.get("puuid") != self.Requests.puuid:
                 continue
+            if presence.get("championId") is not None:
+                continue
             product = str(presence.get("product") or "").lower()
-            if product == "league_of_legends" or (product and product != "valorant"):
+            if product in {"league_of_legends", "lol"} or (product and product != "valorant"):
                 continue
             try:
                 private_data = json.loads(base64.b64decode(presence.get("private", "")))
@@ -72,7 +74,15 @@ class Ws:
 
         for attempt in range(max_retries):
             try:
-                async with websockets.connect(url, ssl=self.ssl_context, extra_headers=local_headers) as websocket:
+                async with websockets.connect(
+                    url,
+                    ssl=self.ssl_context,
+                    extra_headers=local_headers,
+                    open_timeout=5,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as websocket:
                     await websocket.send('[5, "OnJsonApiEvent_chat_v4_presences"]')
                     if self.cfg.get_feature_flag("game_chat"):
                         await websocket.send('[5, "OnJsonApiEvent_chat_v6_messages"]')

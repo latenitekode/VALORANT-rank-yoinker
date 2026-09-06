@@ -1,13 +1,19 @@
+import threading
+
 class PlayerStats:
     def __init__(self, Requests, log, config):
         self.Requests = Requests
         self.log = log
         self.config = config
         self.match_details_cache = {}
+        self._cache_lock = threading.RLock()
+        self._match_locks = {}
 
     def clear_runtime_cache(self):
         """Clear transient runtime caches (safe to call on MENUS/new match)."""
-        self.match_details_cache.clear()
+        with self._cache_lock:
+            self.match_details_cache.clear()
+            self._match_locks.clear()
 
     def _default_stats(self):
         return {
@@ -36,21 +42,33 @@ class PlayerStats:
         if not match_id:
             return None
 
-        if match_id in self.match_details_cache:
-            return self.match_details_cache[match_id]
+        with self._cache_lock:
+            if match_id in self.match_details_cache:
+                return self.match_details_cache[match_id]
+            match_lock = self._match_locks.setdefault(match_id, threading.Lock())
 
-        match_response = self.Requests.fetch(
-            "pd",
-            f"/match-details/v1/matches/{match_id}",
-            "get",
-        )
+        # Same-match requests are single-flight, while different match ids can still
+        # fetch in parallel across player workers.
+        with match_lock:
+            with self._cache_lock:
+                if match_id in self.match_details_cache:
+                    return self.match_details_cache[match_id]
 
-        if match_response.status_code == 404:
-            return None
+            match_response = self.Requests.fetch(
+                "pd",
+                f"/match-details/v1/matches/{match_id}",
+                "get",
+            )
 
-        match_data = match_response.json()
-        self.match_details_cache[match_id] = match_data
-        return match_data
+            if match_response.status_code == 404:
+                return None
+            if not match_response.ok:
+                return None
+
+            match_data = match_response.json()
+            with self._cache_lock:
+                self.match_details_cache[match_id] = match_data
+            return match_data
 
     def get_stats(self, puuid):
         # Early exit if no competitive stats are required.

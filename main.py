@@ -7,7 +7,6 @@ import traceback
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
 import urllib3
 from src.colors import color as colr
 from InquirerPy import inquirer
@@ -167,7 +166,7 @@ try:
 
     log(f"VALORANT rank yoinker v{version}")
 
-    valoApiSkins = requests.get("https://valorant-api.com/v1/weapons/skins")
+    valoApiSkins = loadoutsClass.get_skin_metadata()
     gameContent = content.get_content()
     seasonID = content.get_latest_season_id(gameContent)
     previousSeasonID = content.get_previous_season_id(gameContent)
@@ -183,6 +182,7 @@ try:
     match_player_cache = {
         "match_id": None,
         "players": {},  # puuid -> {"playerRank", "previousPlayerRank", "ppstats", "ts"}
+        "locks": {},    # puuid -> Lock, avoids duplicate foreground/background fetches
     }
     match_player_cache_lock = threading.RLock()
     MATCH_PLAYER_CACHE_TTL_SECONDS = 300  # safety TTL
@@ -191,6 +191,7 @@ try:
         with match_player_cache_lock:
             match_player_cache["match_id"] = match_id
             match_player_cache["players"] = {}
+            match_player_cache["locks"] = {}
 
     def ensure_match_player_cache(match_id):
         # Keep PREGAME data across the transition into Core Game even if Riot uses a
@@ -207,36 +208,53 @@ try:
             ]
             for puuid in expired:
                 del match_player_cache["players"][puuid]
+                match_player_cache["locks"].pop(puuid, None)
 
     def get_or_fetch_rank_and_stats(player_subject, current_match_id):
         if current_match_id:
             ensure_match_player_cache(current_match_id)
             with match_player_cache_lock:
                 cached = match_player_cache["players"].get(player_subject)
+                player_lock = match_player_cache["locks"].setdefault(
+                    player_subject, threading.Lock()
+                )
             if cached is not None:
                 return (
                     cached["playerRank"],
                     cached["previousPlayerRank"],
                     cached["ppstats"],
                 )
+        else:
+            player_lock = threading.Lock()
 
-        # Cache miss -> fetch. Rank.get_rank internally reuses one MMR response for
-        # current+previous. PlayerStats may add recent-comp requests when enabled.
-        playerRank = rank.get_rank(player_subject, seasonID)
-        previousPlayerRank = rank.get_rank(player_subject, previousSeasonID)
-        ppstats = pstats.get_stats(player_subject)
+        # Background prefetch and foreground rendering can reach the same player at
+        # once. Single-flight that player so the speed-up cannot double Riot traffic.
+        with player_lock:
+            if current_match_id:
+                with match_player_cache_lock:
+                    cached = match_player_cache["players"].get(player_subject)
+                if cached is not None:
+                    return (
+                        cached["playerRank"],
+                        cached["previousPlayerRank"],
+                        cached["ppstats"],
+                    )
 
-        if current_match_id:
-            with match_player_cache_lock:
-                match_player_cache["match_id"] = current_match_id
-                match_player_cache["players"][player_subject] = {
-                    "playerRank": dict(playerRank) if isinstance(playerRank, dict) else playerRank,
-                    "previousPlayerRank": dict(previousPlayerRank) if isinstance(previousPlayerRank, dict) else previousPlayerRank,
-                    "ppstats": dict(ppstats) if isinstance(ppstats, dict) else ppstats,
-                    "ts": time.time(),
-                }
+            # Rank.get_rank internally reuses one MMR response for current+previous.
+            playerRank = rank.get_rank(player_subject, seasonID)
+            previousPlayerRank = rank.get_rank(player_subject, previousSeasonID)
+            ppstats = pstats.get_stats(player_subject)
 
-        return playerRank, previousPlayerRank, ppstats
+            if current_match_id:
+                with match_player_cache_lock:
+                    match_player_cache["players"][player_subject] = {
+                        "playerRank": playerRank,
+                        "previousPlayerRank": previousPlayerRank,
+                        "ppstats": ppstats,
+                        "ts": time.time(),
+                    }
+
+            return playerRank, previousPlayerRank, ppstats
 
     def prefetch_player_data(players, current_match_id):
         """Fetch uncached per-player data concurrently with a conservative cap."""
@@ -407,7 +425,7 @@ try:
                         game_state = presences.get_game_state(presence)
                         if game_state is not None:
                             run = False
-                    time.sleep(2)
+                    time.sleep(0.5)
                 log(f"first game state: {game_state}")
             else:
                 previous_game_state = game_state
@@ -440,17 +458,32 @@ try:
                         pstats.clear_runtime_cache()
                 log(f"new game state: {game_state}")
             firstTime = False
-        except TypeError:
-            game_state = "DISCONNECTED"
-            queue_match_result_update(
-                active_match_context.get("match_id"),
-                active_match_context.get("my_team"),
-            )
-            active_match_context["match_id"] = None
-            active_match_context["my_team"] = None
-            reset_match_player_cache()
-            if hasattr(pstats, "clear_runtime_cache"):
-                pstats.clear_runtime_cache()
+        except Exception as error:
+            # A parser/local-presence hiccup is uncertainty, not proof that the Riot
+            # client disconnected. Preserve positive live state when possible.
+            log(f"state acquisition failed: {error}")
+            previous_known_state = locals().get("game_state")
+            recovered_state = live_backbone.current_state()
+            if recovered_state in live_backbone.VALID_STATES:
+                game_state = live_backbone.confirm_transition(
+                    previous_known_state, recovered_state
+                )
+                firstTime = False
+            elif previous_known_state in live_backbone.ACTIVE_STATES:
+                game_state = previous_known_state
+                firstTime = True
+                continue
+            else:
+                game_state = "DISCONNECTED"
+                queue_match_result_update(
+                    active_match_context.get("match_id"),
+                    active_match_context.get("my_team"),
+                )
+                active_match_context["match_id"] = None
+                active_match_context["my_team"] = None
+                reset_match_player_cache()
+                if hasattr(pstats, "clear_runtime_cache"):
+                    pstats.clear_runtime_cache()
 
         process_pending_match_results()
 
@@ -486,6 +519,7 @@ try:
             continue
 
         if True:
+            scoreboard_started_at = time.monotonic()
             log(f"getting new {game_state} scoreboard")
             lastGameState = game_state
             game_state_dict = {
@@ -499,28 +533,27 @@ try:
 
             is_leaderboard_needed = False
             
-            # get new presence
-            presence = presences.get_presence()
+            # get new presence. Queue/party fields are optional UI metadata; a
+            # transient missing row must not crash or hide an otherwise valid table.
+            presence = presences.get_presence() or []
             priv_presence = presences.get_private_presence(presence)
-            
-            # Temp fix: Riot is swapping between nested and flat API structures.
-            party_state = ""
-            if "partyPresenceData" in priv_presence: # Check for nested structure
-                party_state = priv_presence["partyPresenceData"]["partyState"]
-            elif "partyState" in priv_presence: # Check for flattened structure
-                party_state = priv_presence["partyState"]
+            if priv_presence is None:
+                priv_presence = presences.get_cached_private_presence(max_age=8.0) or {}
+
+            party_presence = priv_presence.get("partyPresenceData")
+            if isinstance(party_presence, dict):
+                party_state = party_presence.get("partyState", "")
             else:
-                # No known structure found, log and fail
-                log("ERROR: Unknown presence API structure in 'main'.")
-                party_state = priv_presence["partyPresenceData"]["partyState"]
-            
+                party_state = priv_presence.get("partyState", "")
+
             if (
-                priv_presence["provisioningFlow"] == "CustomGame"
+                priv_presence.get("provisioningFlow") == "CustomGame"
                 or party_state == "CUSTOM_GAME_SETUP"
             ):
                 gamemode = "Custom Game"
             else:
-                gamemode = gamemodes.get(priv_presence["queueId"])
+                queue_id = priv_presence.get("queueId")
+                gamemode = gamemodes.get(queue_id, queue_id or "Unknown")
 
             heartbeat_data = {
                 "time": int(time.time()),
@@ -567,27 +600,39 @@ try:
                 server = coregame_stats.get("GamePodID", "")
                 # Start independent work together. Presence completion is best-effort
                 # for party markers; names and rank/stats do not depend on it.
-                with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live") as prep_pool:
-                    presence_future = prep_pool.submit(
-                        presences.wait_for_presence, namesClass.get_players_puuid(Players)
-                    )
-                    names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
-                    player_future = prep_pool.submit(
-                        prefetch_player_data, Players, coregame_match_id
-                    )
-                    names = names_future.result()
-                    loadout_future = prep_pool.submit(
-                        loadoutsClass.get_match_loadouts,
-                        coregame_match_id,
-                        Players,
-                        cfg.weapon,
-                        valoApiSkins,
-                        names,
-                        "game",
-                    )
-                    loadouts_arr = loadout_future.result()
-                    player_future.result()
-                    presence_future.result()
+                prep_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live")
+                presence_future = prep_pool.submit(
+                    presences.wait_for_presence, namesClass.get_players_puuid(Players)
+                )
+                names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
+                prep_pool.submit(prefetch_player_data, Players, coregame_match_id)
+                try:
+                    names = names_future.result(timeout=4.0)
+                except Exception as exc:
+                    log(f"name preload unavailable; using fallback names: {exc}")
+                    names = {player.get("Subject"): "#" for player in Players if player.get("Subject")}
+                loadout_future = prep_pool.submit(
+                    loadoutsClass.get_match_loadouts,
+                    coregame_match_id,
+                    Players,
+                    cfg.weapon,
+                    valoApiSkins,
+                    names,
+                    "game",
+                )
+                try:
+                    presence_future.result(timeout=1.0)
+                except Exception as exc:
+                    log(f"party presence preload unavailable: {exc}")
+                try:
+                    loadouts_arr = loadout_future.result(timeout=3.0)
+                except Exception as exc:
+                    log(f"loadout preload unavailable; rendering core table without cosmetics: {exc}")
+                    fallback_loadouts = loadoutsClass._empty_payload(Players, state="game")
+                    Server.send_payload("matchLoadout", fallback_loadouts)
+                    loadouts_arr = [{}, fallback_loadouts]
+                finally:
+                    prep_pool.shutdown(wait=False, cancel_futures=True)
                 loadouts = loadouts_arr[0]
                 loadouts_data = loadouts_arr[1]
                 isRange = False
@@ -876,27 +921,39 @@ try:
                 server = pregame_stats.get("GamePodID", "")
                 Players = pregame_stats["AllyTeam"]["Players"]
                 ensure_match_player_cache(pregame_match_id)
-                with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live") as prep_pool:
-                    presence_future = prep_pool.submit(
-                        presences.wait_for_presence, namesClass.get_players_puuid(Players)
-                    )
-                    names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
-                    player_future = prep_pool.submit(
-                        prefetch_player_data, Players, pregame_match_id
-                    )
-                    names = names_future.result()
-                    loadout_future = prep_pool.submit(
-                        loadoutsClass.get_match_loadouts,
-                        pregame_match_id,
-                        pregame_stats,
-                        cfg.weapon,
-                        valoApiSkins,
-                        names,
-                        "pregame",
-                    )
-                    loadouts_arr = loadout_future.result()
-                    player_future.result()
-                    presence_future.result()
+                prep_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live")
+                presence_future = prep_pool.submit(
+                    presences.wait_for_presence, namesClass.get_players_puuid(Players)
+                )
+                names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
+                prep_pool.submit(prefetch_player_data, Players, pregame_match_id)
+                try:
+                    names = names_future.result(timeout=4.0)
+                except Exception as exc:
+                    log(f"name preload unavailable; using fallback names: {exc}")
+                    names = {player.get("Subject"): "#" for player in Players if player.get("Subject")}
+                loadout_future = prep_pool.submit(
+                    loadoutsClass.get_match_loadouts,
+                    pregame_match_id,
+                    pregame_stats,
+                    cfg.weapon,
+                    valoApiSkins,
+                    names,
+                    "pregame",
+                )
+                try:
+                    presence_future.result(timeout=1.0)
+                except Exception as exc:
+                    log(f"party presence preload unavailable: {exc}")
+                try:
+                    loadouts_arr = loadout_future.result(timeout=3.0)
+                except Exception as exc:
+                    log(f"loadout preload unavailable; rendering pregame table without cosmetics: {exc}")
+                    fallback_loadouts = loadoutsClass._empty_payload(pregame_stats, state="pregame")
+                    Server.send_payload("matchLoadout", fallback_loadouts)
+                    loadouts_arr = [{}, fallback_loadouts]
+                finally:
+                    prep_pool.shutdown(wait=False, cancel_futures=True)
                 loadouts = loadouts_arr[0]
                 loadouts_data = loadouts_arr[1]
                 playersLoaded = 1
@@ -1313,6 +1370,10 @@ try:
                 table.set_caption(f"VALORANT rank yoinker v{version}")
                 Server.send_payload("heartbeat", heartbeat_data)
                 table.display()
+                log(
+                    f"scoreboard visible: state={game_state}, "
+                    f"elapsed={time.monotonic() - scoreboard_started_at:.2f}s"
+                )
                 firstPrint = False
 
                 # print(f"VALORANT rank yoinker v{version}")

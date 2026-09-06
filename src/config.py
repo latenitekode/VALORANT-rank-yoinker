@@ -72,7 +72,16 @@ class Config:
         return jsonToWrite
 
     def weapon_check(self, name):
-        if name in [weapon["displayName"] for weapon in requests.get("https://valorant-api.com/v1/weapons").json()["data"]]:
-            return True
-        else:
-            return False
+        try:
+            response = requests.get(
+                "https://valorant-api.com/v1/weapons", timeout=(2.5, 6.0)
+            )
+            response.raise_for_status()
+            return name in [
+                weapon["displayName"] for weapon in response.json().get("data", [])
+            ]
+        except requests.RequestException as exc:
+            # Weapon display is optional. Keep a user's existing non-empty value when
+            # valorant-api.com is temporarily unavailable instead of blocking config.
+            self.log(f"weapon validation unavailable: {exc}")
+            return bool(name)
