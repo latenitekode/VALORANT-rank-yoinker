@@ -4,7 +4,7 @@ import os
 from InquirerPy import inquirer, prompt
 from InquirerPy.separator import Separator
 
-from src.constants import DEFAULT_CONFIG
+from src.constants import DEFAULT_CONFIG, PROJECT_ROOT
 
 from src.questions import *
 
@@ -13,7 +13,7 @@ def configure():
     default_config = DEFAULT_CONFIG
 
     try:
-        with open("config.json", "r") as openfile:
+        with open(os.path.join(PROJECT_ROOT, "config.json"), "r") as openfile:
             user_config = default_config | json.load(openfile)
     except FileNotFoundError:
         print("Generating default configuration")
@@ -67,7 +67,7 @@ def configure():
 
     if proceed:
         config = default_config | user_config | changed_config
-        with open("config.json", "w") as outfile:
+        with open(os.path.join(PROJECT_ROOT, "config.json"), "w") as outfile:
             json.dump(config, outfile, indent=4)
     else:
         config = default_config | user_config

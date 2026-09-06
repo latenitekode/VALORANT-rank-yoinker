@@ -7,13 +7,6 @@
 [![Discord][discord-shield]][discord-url]
 [![Downloads][downloads-shield]][downloads-url]
 
-> [!CAUTION]
-> vRY has published its final release, no changes will be made to the code.
-> 
-> [Community forks](COMMUNITY.md) may be maintained.
-
----
-
   <ol>
     <li><a href="#about-the-project">About The Project</a></li>
     <li><a href="#usage">Usage</a></li>
@@ -40,14 +33,14 @@
 ### Bundled Release:
 
 1) Download [Microsoft Visual C++ Libraries](https://github.com/abbodi1406/vcredist/releases)
-2) Download the [release](https://github.com/isaacKenyon/valorant-rank-yoinker/releases/latest).
+2) Download the [release](https://github.com/mdevio/valorant-rank-yoinker/releases/latest).
 3) Extract **all** files.
 4) Run vRY.exe.
 
 ### Running from source:
 
-1) Download Python [3.11](https://www.python.org/downloads/release/python-3119/) or [3.10](https://www.python.org/downloads/release/python-31011/), make sure it is added to the PATH. (This is an option on installation.)
-2) Download the [source](https://github.com/isaacKenyon/VALORANT-rank-yoinker/archive/refs/heads/main.zip).
+1) Download Python [3.14.5](https://www.python.org/downloads/release/python-3145/) (recommended), [3.11](https://www.python.org/downloads/release/python-3119/) or [3.10](https://www.python.org/downloads/release/python-31011/), and make sure it is added to your PATH. (This is an option during installation.)
+2) Download the [source](https://github.com/mdevio/VALORANT-rank-yoinker/archive/refs/heads/main.zip).
 3) Run **`INSTALL.bat`** file (or use `pip install -r requirements.txt` in the terminal)
 4) Run **`START.bat`** file (or use `python main.py` in the terminal)
 
@@ -59,17 +52,18 @@
 
 > `-` You can change the desired weapon by editing the gun in `config.json`, or by deleting the file for vRY re-prompt you.
 
-> `-` View all skins: <https://vry.netlify.app/matchLoadouts>.
+> `-` View player inventories/loadouts with the bundled local viewer shown in the terminal output.  
+> Legacy hosted viewer: <https://vry.netlify.app/matchLoadouts> (not maintained by this fork).
 
 ### Letting Github Build It:
 
-The latest commits to the `main` branch will be built by a [Github Actions](https://github.com/isaacKenyon/VALORANT-rank-yoinker/actions) workflow
+The latest commits to the `main` branch will be built by a [Github Actions](https://github.com/mdevio/VALORANT-rank-yoinker/actions) workflow
 and a successful build should result in a compiled artifact that you can download and try out.
-See the [Actions tab](https://github.com/isaacKenyon/VALORANT-rank-yoinker/actions), click on the `Build` workflow,
+See the [Actions tab](https://github.com/mdevio/VALORANT-rank-yoinker/actions), click on the `Build` workflow,
 select a particular workflow run, and it should have an artifact available for download.
 
 If you want to make a small change to the application, you can:
-1) [Fork](https://github.com/isaacKenyon/VALORANT-rank-yoinker/fork) this project.
+1) [Fork](https://github.com/mdevio/VALORANT-rank-yoinker/fork) this project.
 2) Change the code in your forked repository.
 3) Let the Github Actions workflow build vRY.exe for you.
 4) Download it and test it.
@@ -107,5 +101,5 @@ Whilst effort has been made to abide by Riot's API rules; you acknowledge that u
 [discord-url]: https://discord.gg/HeTKed64Ka
 [discord-banner]: https://discordapp.com/api/guilds/872101595037446144/widget.png?style=banner2
 
-[downloads-shield]: https://img.shields.io/github/downloads/zayKenyon/VALORANT-rank-yoinker/total?style=for-the-badge&logo=github
-[downloads-url]: https://github.com/zayKenyon/VALORANT-rank-yoinker/releases/latest
+[downloads-shield]: https://img.shields.io/github/downloads/mdevio/VALORANT-rank-yoinker/total?style=for-the-badge&logo=github
+[downloads-url]: https://github.com/mdevio/VALORANT-rank-yoinker/releases/latest

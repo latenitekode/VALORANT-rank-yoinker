@@ -4,11 +4,14 @@ import socket
 import sys
 import time
 import traceback
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import urllib3
-from colr import color as colr
+from src.colors import color as colr
 from InquirerPy import inquirer
+from pathlib import Path
 from rich.console import Console as RichConsole
 
 from src.colors import Colors
@@ -32,6 +35,7 @@ from src.states.pregame import Pregame
 from src.stats import Stats
 from src.table import Table
 from src.websocket import Ws
+from src.live_backbone import LiveBackbone
 from src.os_info import get_os
 
 from src.account_manager.account_manager import AccountManager
@@ -62,6 +66,24 @@ def get_ip():
     finally:
         s.close()
     return IP
+
+
+def format_last_active(last_active_epoch):
+    if not last_active_epoch:
+        return "N/A"
+
+    try:
+        seconds_ago = max(0, int(time.time() - float(last_active_epoch)))
+    except (TypeError, ValueError):
+        return "N/A"
+
+    if seconds_ago < 60:
+        return "now"
+    if seconds_ago < 3600:
+        return f"{seconds_ago // 60}m ago"
+    if seconds_ago < 86400:
+        return f"{seconds_ago // 3600}h ago"
+    return f"{seconds_ago // 86400}d ago"
 
 
 try:
@@ -112,6 +134,7 @@ try:
     menu = Menu(Requests, log, presences)
     pregame = Pregame(Requests, log)
     coregame = Coregame(Requests, log)
+    live_backbone = LiveBackbone(Requests, presences, log)
 
     Server = Server(log, ErrorSRC)
     Server.start_server()
@@ -124,9 +147,10 @@ try:
 
     current_map = coregame.get_current_map(map_urls, map_splashes)
 
-    colors = Colors(log, hide_names, agent_dict, AGENTCOLORLIST)
+    colors = Colors(log, hide_names, agent_dict, AGENTCOLORLIST, tierDict)
 
     loadoutsClass = Loadouts(Requests, log, colors, Server, current_map)
+    loadoutsClass.prime_metadata_async()
     table = Table(cfg, log)
 
     stats = Stats()
@@ -149,41 +173,46 @@ try:
     previousSeasonID = content.get_previous_season_id(gameContent)
     lastGameState = ""
 
+    active_match_context = {"match_id": None, "my_team": None}
+    pending_match_results = {}
+    resolved_match_results = set()
+    match_result_retry_seconds = 30
+    match_result_max_attempts = 5
+
     # Cache rank+stats per player for the current match so PREGAME data can be reused in INGAME
     match_player_cache = {
         "match_id": None,
         "players": {},  # puuid -> {"playerRank", "previousPlayerRank", "ppstats", "ts"}
     }
+    match_player_cache_lock = threading.RLock()
     MATCH_PLAYER_CACHE_TTL_SECONDS = 300  # safety TTL
 
     def reset_match_player_cache(match_id=None):
-        match_player_cache["match_id"] = match_id
-        match_player_cache["players"] = {}
+        with match_player_cache_lock:
+            match_player_cache["match_id"] = match_id
+            match_player_cache["players"] = {}
 
     def ensure_match_player_cache(match_id):
-        if not match_id:
-            return
-
-        # New match => reset cache
-        if match_player_cache["match_id"] != match_id:
-            reset_match_player_cache(match_id)
-            return
-
-        # TTL cleanup (safety)
+        # Keep PREGAME data across the transition into Core Game even if Riot uses a
+        # different match id. MENUS/new-session paths explicitly clear this cache.
+        # This lets allies render instantly in-game while only new opponents need work.
         now = time.time()
-        expired = []
-        for puuid, cached in match_player_cache["players"].items():
-            ts = cached.get("ts", now)
-            if (now - ts) > MATCH_PLAYER_CACHE_TTL_SECONDS:
-                expired.append(puuid)
-
-        for puuid in expired:
-            del match_player_cache["players"][puuid]
+        with match_player_cache_lock:
+            if match_id:
+                match_player_cache["match_id"] = match_id
+            expired = [
+                puuid
+                for puuid, cached in match_player_cache["players"].items()
+                if (now - cached.get("ts", now)) > MATCH_PLAYER_CACHE_TTL_SECONDS
+            ]
+            for puuid in expired:
+                del match_player_cache["players"][puuid]
 
     def get_or_fetch_rank_and_stats(player_subject, current_match_id):
         if current_match_id:
             ensure_match_player_cache(current_match_id)
-            cached = match_player_cache["players"].get(player_subject)
+            with match_player_cache_lock:
+                cached = match_player_cache["players"].get(player_subject)
             if cached is not None:
                 return (
                     cached["playerRank"],
@@ -191,29 +220,164 @@ try:
                     cached["ppstats"],
                 )
 
-        # Cache miss -> fetch
+        # Cache miss -> fetch. Rank.get_rank internally reuses one MMR response for
+        # current+previous. PlayerStats may add recent-comp requests when enabled.
         playerRank = rank.get_rank(player_subject, seasonID)
         previousPlayerRank = rank.get_rank(player_subject, previousSeasonID)
         ppstats = pstats.get_stats(player_subject)
 
-        if current_match_id and match_player_cache["match_id"] == current_match_id:
-            match_player_cache["players"][player_subject] = {
-                "playerRank": dict(playerRank) if isinstance(playerRank, dict) else playerRank,
-                "previousPlayerRank": dict(previousPlayerRank) if isinstance(previousPlayerRank, dict) else previousPlayerRank,
-                "ppstats": dict(ppstats) if isinstance(ppstats, dict) else ppstats,
-                "ts": time.time(),
-            }
+        if current_match_id:
+            with match_player_cache_lock:
+                match_player_cache["match_id"] = current_match_id
+                match_player_cache["players"][player_subject] = {
+                    "playerRank": dict(playerRank) if isinstance(playerRank, dict) else playerRank,
+                    "previousPlayerRank": dict(previousPlayerRank) if isinstance(previousPlayerRank, dict) else previousPlayerRank,
+                    "ppstats": dict(ppstats) if isinstance(ppstats, dict) else ppstats,
+                    "ts": time.time(),
+                }
 
         return playerRank, previousPlayerRank, ppstats
 
-    print("\nvRY Mobile", color(f"- {get_ip()}:{cfg.port}", fore=(255, 127, 80)))
+    def prefetch_player_data(players, current_match_id):
+        """Fetch uncached per-player data concurrently with a conservative cap."""
+        subjects = list(dict.fromkeys(
+            p.get("Subject") for p in (players or []) if p.get("Subject")
+        ))
+        if not subjects:
+            return
+        ensure_match_player_cache(current_match_id)
+        with match_player_cache_lock:
+            missing = [x for x in subjects if x not in match_player_cache["players"]]
+        if not missing:
+            return
+        workers = min(4, len(missing))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vry-player") as pool:
+            futures = {
+                pool.submit(get_or_fetch_rank_and_stats, puuid, current_match_id): puuid
+                for puuid in missing
+            }
+            for future in as_completed(futures):
+                puuid = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    log(f"player prefetch failed for {puuid}: {exc}")
 
-    print(
-        color(
-            "\nVisit https://vry.netlify.app/matchLoadouts to view full player inventories\n",
-            fore=(255, 253, 205),
-        )
-    )
+    def queue_match_result_update(match_id, my_team):
+        if not match_id or not my_team or match_id in resolved_match_results:
+            return
+        if match_id in pending_match_results:
+            return
+        pending_match_results[match_id] = {
+            "my_team": my_team,
+            "attempts": 0,
+            "next_attempt": 0,
+        }
+        log(f"queued encounter result update for match {match_id}")
+
+    def parse_match_result(match_data):
+        if not isinstance(match_data, dict):
+            return None, None
+        match_info = match_data.get("matchInfo", {})
+        winning_team = None
+        for key in ("winningTeam", "WinningTeam", "winningTeamId", "WinningTeamID"):
+            if key in match_info:
+                winning_team = match_info.get(key)
+                break
+        teams = match_data.get("teams") or match_data.get("Teams") or []
+        scores = {}
+        ordered_team_ids = []
+        for team in teams:
+            if not isinstance(team, dict):
+                continue
+            team_id = None
+            for key in ("teamId", "teamID", "TeamID", "team_id"):
+                if key in team:
+                    team_id = team.get(key)
+                    break
+            if not team_id:
+                continue
+            ordered_team_ids.append(team_id)
+            rounds_won = None
+            for key in ("roundsWon", "RoundsWon", "score", "Score"):
+                if key in team:
+                    rounds_won = team.get(key)
+                    break
+            try:
+                scores[team_id] = int(rounds_won or 0)
+            except (TypeError, ValueError):
+                scores[team_id] = 0
+            if team.get("won") is True or team.get("Won") is True:
+                winning_team = team_id
+        if winning_team is None and scores:
+            top_score = max(scores.values())
+            top_teams = [tid for tid, s in scores.items() if s == top_score]
+            if len(top_teams) == 1:
+                winning_team = top_teams[0]
+        score = None
+        if "Blue" in scores and "Red" in scores:
+            score = f"{scores['Blue']}-{scores['Red']}"
+        elif len(ordered_team_ids) == 2:
+            score = f"{scores.get(ordered_team_ids[0], 0)}-{scores.get(ordered_team_ids[1], 0)}"
+        return winning_team, score
+
+    def _retry_pending(match_id, pending, reason):
+        if pending["attempts"] >= match_result_max_attempts:
+            log(f"giving up encounter result update for match {match_id}: {reason}")
+            pending_match_results.pop(match_id, None)
+            return
+        pending["next_attempt"] = time.time() + match_result_retry_seconds
+        log(f"retrying encounter result update for match {match_id} in {match_result_retry_seconds}s: {reason}")
+
+    def process_pending_match_results():
+        if not pending_match_results:
+            return
+        now = time.time()
+        for match_id, pending in list(pending_match_results.items()):
+            if now < pending["next_attempt"]:
+                continue
+            pending["attempts"] += 1
+            try:
+                response = Requests.fetch("pd", f"/match-details/v1/matches/{match_id}", "get")
+                if response is None:
+                    _retry_pending(match_id, pending, "empty response")
+                    continue
+                if getattr(response, "status_code", None) == 404:
+                    _retry_pending(match_id, pending, "match details not ready")
+                    continue
+                match_data = response.json()
+                winning_team, score = parse_match_result(match_data)
+                if not winning_team:
+                    _retry_pending(match_id, pending, "winner not found")
+                    continue
+                changed = stats.update_match_result(match_id, pending["my_team"], winning_team, score=score)
+                resolved_match_results.add(match_id)
+                pending_match_results.pop(match_id, None)
+                log(
+                    f"saved encounter result for match {match_id}: "
+                    f"my_team={pending['my_team']} winning_team={winning_team} "
+                    f"score={score} changed={changed}"
+                )
+            except Exception as error:
+                log(f"failed encounter result update for match {match_id}: {error}")
+                _retry_pending(match_id, pending, "request failed")
+
+    def print_info():
+        if cfg.get_feature_flag("pre_cls") or firstPrint:
+            os.system("cls")
+            print("\nvRY Mobile", color(f"- {get_ip()}:{cfg.port}", fore=(255, 127, 80)))
+
+            inventories_url = (PROJECT_ROOT / Path("docs/matchLoadouts.html")).resolve().as_uri()
+            inventories_link = (
+                f"\033]8;;{inventories_url}\033\\"
+                "View in browser"
+                f"\033]8;;\033\\"
+            )
+
+            print(
+                "\nPlayer Inventories",
+                color(f"- {inventories_link}", fore=(255, 127, 80)),
+            )
 
     richConsole = RichConsole()
 
@@ -231,13 +395,6 @@ try:
             Ranks = NUMBERTORANKS
 
         try:
-
-            # loop = asyncio.get_event_loop()
-            # loop.run_until_complete(Wss.conntect_to_websocket())
-            # if firstTime:
-            #     loop = asyncio.new_event_loop()
-            #     asyncio.set_event_loop(loop)
-            #     game_state = loop.run_until_complete(Wss.conntect_to_websocket(game_state))
             if firstTime:
                 run = True
                 while run:
@@ -253,12 +410,28 @@ try:
                     time.sleep(2)
                 log(f"first game state: {game_state}")
             else:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 previous_game_state = game_state
-                game_state = loop.run_until_complete(
+                websocket_state = asyncio.run(
                     Wss.recconect_to_websocket(game_state)
                 )
+                game_state = live_backbone.confirm_transition(
+                    previous_game_state, websocket_state
+                )
+                if websocket_state != game_state:
+                    log(
+                        f"live backbone held state {previous_game_state}; "
+                        f"websocket proposed {websocket_state}"
+                    )
+                    # Keep the already-rendered scoreboard. Wait for the next event
+                    # rather than doing all player work again for a rejected flicker.
+                    continue
+                if previous_game_state == "INGAME" and game_state != "INGAME":
+                    queue_match_result_update(
+                        active_match_context.get("match_id"),
+                        active_match_context.get("my_team"),
+                    )
+                    active_match_context["match_id"] = None
+                    active_match_context["my_team"] = None
                 # We invalidate the cached responses when going from any state to menus
                 if previous_game_state != game_state and game_state == "MENUS":
                     rank.invalidate_cached_responses()
@@ -266,16 +439,20 @@ try:
                     if hasattr(pstats, "clear_runtime_cache"):
                         pstats.clear_runtime_cache()
                 log(f"new game state: {game_state}")
-                loop.close()
             firstTime = False
-            # loop = asyncio.new_event_loop()
-            # asyncio.set_event_loop(loop)
-            # loop.run_until_complete()
         except TypeError:
             game_state = "DISCONNECTED"
+            queue_match_result_update(
+                active_match_context.get("match_id"),
+                active_match_context.get("my_team"),
+            )
+            active_match_context["match_id"] = None
+            active_match_context["my_team"] = None
             reset_match_player_cache()
             if hasattr(pstats, "clear_runtime_cache"):
                 pstats.clear_runtime_cache()
+
+        process_pending_match_results()
 
         if game_state == "DISCONNECTED":
             richConsole.print("[yellow]Disconnected from Valorant. Attempting to reconnect...[/yellow]")
@@ -317,8 +494,8 @@ try:
                 "MENUS": color("In-Menus", fore=(238, 241, 54)),
             }
 
-            if (not firstPrint) and cfg.get_feature_flag("pre_cls"):
-                os.system("cls")
+
+            print_info()
 
             is_leaderboard_needed = False
             
@@ -354,10 +531,16 @@ try:
             }
 
             if game_state == "INGAME":
-                coregame_stats = coregame.get_coregame_stats()
-                if coregame_stats == None:
+                coregame_stats, coregame_match_id = live_backbone.wait_for_match(
+                    "INGAME", timeout=8.0
+                )
+                if coregame_stats is None:
+                    # Presence can lead GLZ by a moment. Do not go back to waiting for
+                    # another websocket transition; force a fresh local-state pass.
+                    if live_backbone.current_state() == "INGAME":
+                        firstTime = True
                     continue
-                coregame_match_id = coregame.get_coregame_match_id()
+                coregame.match_id = coregame_match_id
                 ensure_match_player_cache(coregame_match_id)
                 Players = coregame_stats["Players"]
                 # data for chat to function
@@ -382,19 +565,31 @@ try:
                 Wss.set_player_data(players_data)
 
                 server = coregame_stats.get("GamePodID", "")
-                presences.wait_for_presence(namesClass.get_players_puuid(Players))
-                names = namesClass.get_names_from_puuids(Players)
-                loadouts_arr = loadoutsClass.get_match_loadouts(
-                    coregame_match_id,
-                    Players,
-                    cfg.weapon,
-                    valoApiSkins,
-                    names,
-                    state="game",
-                )
+                # Start independent work together. Presence completion is best-effort
+                # for party markers; names and rank/stats do not depend on it.
+                with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live") as prep_pool:
+                    presence_future = prep_pool.submit(
+                        presences.wait_for_presence, namesClass.get_players_puuid(Players)
+                    )
+                    names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
+                    player_future = prep_pool.submit(
+                        prefetch_player_data, Players, coregame_match_id
+                    )
+                    names = names_future.result()
+                    loadout_future = prep_pool.submit(
+                        loadoutsClass.get_match_loadouts,
+                        coregame_match_id,
+                        Players,
+                        cfg.weapon,
+                        valoApiSkins,
+                        names,
+                        "game",
+                    )
+                    loadouts_arr = loadout_future.result()
+                    player_future.result()
+                    presence_future.result()
                 loadouts = loadouts_arr[0]
                 loadouts_data = loadouts_arr[1]
-                # with alive_bar(total=len(Players), title='Fetching Players', bar='classic2') as bar:
                 isRange = False
                 playersLoaded = 1
 
@@ -420,69 +615,43 @@ try:
                     already_played_with = []
                     stats_data = stats.read_data()
 
+                    allyTeam = None
                     for p in Players:
                         if p["Subject"] == Requests.puuid:
                             allyTeam = p["TeamID"]
+                    if coregame_match_id and allyTeam:
+                        active_match_context["match_id"] = coregame_match_id
+                        active_match_context["my_team"] = allyTeam
+
+                    heartbeat_data["myTeam"] = allyTeam
                     for player in Players:
                         status.update(
                             f"Loading players... [{playersLoaded}/{len(Players)}]"
                         )
                         playersLoaded += 1
 
-                        if player["Subject"] in stats_data.keys():
-                            if (
-                                player["Subject"] != Requests.puuid
-                                and player["Subject"] not in partyMembersList
-                            ):
-                                curr_player_stat = stats_data[player["Subject"]][-1]
-                                i = 1
-                                while (
-                                    curr_player_stat["match_id"] == coregame.match_id
-                                    and len(stats_data[player["Subject"]]) > i
-                                ):
-                                    i += 1
-                                    # if curr_player_stat["match_id"] == coregame.match_id and len(stats_data[player["Subject"]]) > 1:
-                                    curr_player_stat = stats_data[player["Subject"]][-i]
-                                if curr_player_stat["match_id"] != coregame.match_id:
-                                    # checking for party memebers and self players
-                                    times = 0
-                                    m_set = ()
-                                    for m in stats_data[player["Subject"]]:
-                                        if (
-                                            m["match_id"] != coregame.match_id
-                                            and m["match_id"] not in m_set
-                                        ):
-                                            times += 1
-                                            m_set += (m["match_id"],)
-                                    if player["PlayerIdentity"]["Incognito"] == False:
-                                        already_played_with.append(
-                                            {
-                                                "times": times,
-                                                "name": curr_player_stat["name"],
-                                                "agent": curr_player_stat["agent"],
-                                                "time_diff": time.time()
-                                                - curr_player_stat["epoch"],
-                                            }
-                                        )
-                                    else:
-                                        if player["TeamID"] == allyTeam:
-                                            team_string = "your"
-                                        else:
-                                            team_string = "enemy"
-                                        already_played_with.append(
-                                            {
-                                                "times": times,
-                                                "name": agent_dict.get(
-                                                    player["CharacterID"].lower(), "Unknown"
-                                                )
-                                                + " on "
-                                                + team_string
-                                                + " team",
-                                                "agent": curr_player_stat["agent"],
-                                                "time_diff": time.time()
-                                                - curr_player_stat["epoch"],
-                                            }
-                                        )
+                        if (
+                            player["Subject"] != Requests.puuid
+                            and player["Subject"] not in partyMembersList
+                        ):
+                            current_relation = "ally" if player["TeamID"] == allyTeam else "enemy"
+                            summary = stats.build_encounter_summary(
+                                stats_data,
+                                player["Subject"],
+                                coregame.match_id,
+                                fallback_name=names.get(player["Subject"], "#"),
+                                fallback_relation=current_relation,
+                            )
+                            if summary is not None:
+                                if player["PlayerIdentity"]["Incognito"]:
+                                    team_string = "your" if player["TeamID"] == allyTeam else "enemy"
+                                    summary["name"] = (
+                                        agent_dict.get(player["CharacterID"].lower(), "Unknown")
+                                        + " on "
+                                        + team_string
+                                        + " team"
+                                    )
+                                already_played_with.append(summary)
 
                         party_icon = ""
                         # set party premade icon
@@ -516,13 +685,6 @@ try:
                                         + "rr",
                                     }
                                 )
-                        # rankStatus = playerRank[1]
-                        # useless code since rate limit is handled in the requestsV
-                        # while not rankStatus:
-                        #     print("You have been rate limited, 😞 waiting 10 seconds!")
-                        #     time.sleep(10)
-                        #     playerRank = rank.get_rank(player["Subject"], seasonID)
-                        #     rankStatus = playerRank[1]
 
                         hs = ppstats["hs"]
                         kd = ppstats["kd"]
@@ -532,6 +694,7 @@ try:
                         ranked_rating_earned = colors.get_rr_gradient(
                             rr_numeric_value, afk_penalty
                         )
+                        last_active = format_last_active(ppstats.get("LastActiveEpoch"))
 
                         player_level = player["PlayerIdentity"].get("AccountLevel")
 
@@ -578,9 +741,6 @@ try:
 
                         # NAME
                         name = Namecolor
-
-                        # VIEWS
-                        # views = get_views(names[player["Subject"]])
 
                         # skin
                         skin = loadouts.get(player["Subject"], "")
@@ -632,7 +792,6 @@ try:
                                 party_icon,
                                 agent,
                                 name,
-                                # views,
                                 skin,
                                 rankName,
                                 rr,
@@ -644,12 +803,17 @@ try:
                                 kd,
                                 level,
                                 ranked_rating_earned,
+                                last_active,
                             ]
                         )
 
                         heartbeat_data["players"][player["Subject"]] = {
                             "puuid": player["Subject"],
-                            "name": names[player["Subject"]],
+                            "name": names.get(player["Subject"], ""),
+                            "RiotName": names.get(player["Subject"], ""),
+                            "GameName": names.get(player["Subject"], ""),
+                            "relation": "ally" if player["TeamID"] == allyTeam else "enemy",
+                            "myTeam": allyTeam,
                             "partyNumber": partyNum if party_icon != "" else 0,
                             "agent": agent_dict.get(player["CharacterID"].lower(), "Unknown"),
                             "rank": playerRank["rank"],
@@ -659,6 +823,7 @@ try:
                             "kd": ppstats["kd"],
                             "headshotPercentage": ppstats["hs"],
                             "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
+                            "lastActive": last_active,
                             "level": player_level,
                             "agentImgLink": loadouts_data["Players"][
                                 player["Subject"]
@@ -690,27 +855,52 @@ try:
                                     "rr": rr,
                                     "match_id": coregame.match_id,
                                     "epoch": time.time(),
+                                    "relation": "ally" if player["TeamID"] == allyTeam else "enemy",
+                                    "team": player["TeamID"],
+                                    "my_team": allyTeam,
+                                    "result": None,
+                                    "score": None,
                                 }
                             }
                         )
                         # bar()
             elif game_state == "PREGAME":
                 already_played_with = []
-                pregame_stats = pregame.get_pregame_stats()
-                if pregame_stats == None:
+                pregame_stats, pregame_match_id = live_backbone.wait_for_match(
+                    "PREGAME", timeout=5.0
+                )
+                if pregame_stats is None:
+                    if live_backbone.current_state() == "PREGAME":
+                        firstTime = True
                     continue
                 server = pregame_stats.get("GamePodID", "")
                 Players = pregame_stats["AllyTeam"]["Players"]
-                presences.wait_for_presence(namesClass.get_players_puuid(Players))
-                names = namesClass.get_names_from_puuids(Players)
-                pregame_match_id = pregame_stats.get("ID")
                 ensure_match_player_cache(pregame_match_id)
-                # temporary until other regions gets fixed?
-                # loadouts = loadoutsClass.get_match_loadouts(pregame.get_pregame_match_id(), pregame_stats, cfg.weapon, valoApiSkins, names,
-                #   state="pregame")
+                with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vry-live") as prep_pool:
+                    presence_future = prep_pool.submit(
+                        presences.wait_for_presence, namesClass.get_players_puuid(Players)
+                    )
+                    names_future = prep_pool.submit(namesClass.get_names_from_puuids, Players)
+                    player_future = prep_pool.submit(
+                        prefetch_player_data, Players, pregame_match_id
+                    )
+                    names = names_future.result()
+                    loadout_future = prep_pool.submit(
+                        loadoutsClass.get_match_loadouts,
+                        pregame_match_id,
+                        pregame_stats,
+                        cfg.weapon,
+                        valoApiSkins,
+                        names,
+                        "pregame",
+                    )
+                    loadouts_arr = loadout_future.result()
+                    player_future.result()
+                    presence_future.result()
+                loadouts = loadouts_arr[0]
+                loadouts_data = loadouts_arr[1]
                 playersLoaded = 1
                 with richConsole.status("Loading Players...") as status:
-                    # with alive_bar(total=len(Players), title='Fetching Players', bar='classic2') as bar:
                     presence = presences.get_presence()
                     partyOBJ = menu.get_party_json(
                         namesClass.get_players_puuid(Players), presence
@@ -726,6 +916,22 @@ try:
                     )
                     partyCount = 0
                     partyIcons = {}
+
+                    allyTeam = None
+                    for team in pregame_stats.get("Teams", []):
+                        for team_player in team.get("Players", []):
+                            if team_player.get("Subject") == Requests.puuid:
+                                allyTeam = team.get("TeamID")
+                                break
+                        if allyTeam:
+                            break
+                    if allyTeam is None:
+                        for local_player in Players:
+                            if local_player.get("Subject") == Requests.puuid:
+                                allyTeam = local_player.get("TeamID")
+                                break
+                    heartbeat_data["myTeam"] = allyTeam
+
                     for player in Players:
                         status.update(
                             f"Loading players... [{playersLoaded}/{len(Players)}]"
@@ -764,14 +970,6 @@ try:
                                         + "rr",
                                     }
                                 )
-                        # rankStatus = playerRank[1]
-                        # useless code since rate limit is handled in the requestsV
-                        # while not rankStatus:
-                        #     print("You have been rate limited, 😞 waiting 10 seconds!")
-                        #     time.sleep(10)
-                        #     playerRank = rank.get_rank(player["Subject"], seasonID)
-                        #     rankStatus = playerRank[1]
-                        # playerRank = playerRank[0]
 
                         hs = ppstats["hs"]
                         kd = ppstats["kd"]
@@ -781,6 +979,7 @@ try:
                         ranked_rating_earned = colors.get_rr_gradient(
                             rr_numeric_value, afk_penalty
                         )
+                        last_active = format_last_active(ppstats.get("LastActiveEpoch"))
 
                         player_level = player["PlayerIdentity"].get("AccountLevel")
                         if player["PlayerIdentity"]["Incognito"]:
@@ -834,12 +1033,11 @@ try:
                         # NAME
                         name = NameColor
 
-                        # VIEWS
-                        # views = get_views(names[player["Subject"]])
-
-                        # temporary until other regions gets fixed?
-                        # skin
-                        # skin = loadouts[player["Subject"]]
+                        # SKIN
+                        skin = loadouts.get(player["Subject"], "")
+                        player_loadout = loadouts_data["Players"].get(
+                            player["Subject"], {}
+                        )
 
                         # RANK
                         rankName = Ranks[playerRank["rank"]]
@@ -888,8 +1086,7 @@ try:
                                 party_icon,
                                 agent,
                                 name,
-                                # views,
-                                "",
+                                skin,
                                 rankName,
                                 rr,
                                 peakRank,
@@ -900,11 +1097,17 @@ try:
                                 kd,
                                 level,
                                 ranked_rating_earned,
+                                last_active,
                             ]
                         )
 
                         heartbeat_data["players"][player["Subject"]] = {
-                            "name": names[player["Subject"]],
+                            "puuid": player["Subject"],
+                            "name": names.get(player["Subject"], ""),
+                            "RiotName": names.get(player["Subject"], ""),
+                            "GameName": names.get(player["Subject"], ""),
+                            "relation": "ally" if allyTeam is None or player.get("TeamID") == allyTeam else "enemy",
+                            "myTeam": allyTeam,
                             "partyNumber": partyNum if party_icon != "" else 0,
                             "agent": agent_dict.get(player["CharacterID"].lower(), "Unknown"),
                             "rank": playerRank["rank"],
@@ -915,9 +1118,15 @@ try:
                             "kd": ppstats["kd"],
                             "headshotPercentage": ppstats["hs"],
                             "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
+                            "lastActive": last_active,
+                            "agentImgLink": player_loadout.get("Agent", None),
+                            "team": player_loadout.get("Team", None),
+                            "sprays": player_loadout.get("Sprays", None),
+                            "title": player_loadout.get("Title", None),
+                            "playerCard": player_loadout.get("PlayerCard", None),
+                            "weapons": player_loadout.get("Weapons", None),
                         }
 
-                        # bar()
             if game_state == "MENUS":
                 reset_match_player_cache()
                 if hasattr(pstats, "clear_runtime_cache"):
@@ -929,7 +1138,6 @@ try:
                 names = namesClass.get_names_from_puuids(Players)
                 playersLoaded = 1
                 with richConsole.status("Loading Players...") as status:
-                    # with alive_bar(total=len(Players), title='Fetching Players', bar='classic2') as bar:
                     # log(f"retrieved names dict: {names}")
                     Players.sort(
                         key=lambda Players: Players["PlayerIdentity"].get(
@@ -964,15 +1172,6 @@ try:
                                         }
                                     )
 
-                            # rankStatus = playerRank[1]
-                            # useless code since rate limit is handled in the requestsV
-                            # while not rankStatus:
-                            #     print("You have been rate limited, 😞 waiting 10 seconds!")
-                            #     time.sleep(10)
-                            #     playerRank = rank.get_rank(player["Subject"], seasonID)
-                            #     rankStatus = playerRank[1]
-                            # playerRank = playerRank["rank"]
-
                             ppstats = pstats.get_stats(player["Subject"])
                             hs = ppstats["hs"]
                             kd = ppstats["kd"]
@@ -982,6 +1181,7 @@ try:
                             ranked_rating_earned = colors.get_rr_gradient(
                                 rr_numeric_value, afk_penalty
                             )
+                            last_active = ""
 
                             player_level = player["PlayerIdentity"].get("AccountLevel")
                             PLcolor = colors.level_to_color(player_level)
@@ -1053,6 +1253,7 @@ try:
                                     kd,
                                     level,
                                     ranked_rating_earned,
+                                    last_active,
                                 ]
                             )
 
@@ -1066,12 +1267,11 @@ try:
                                 "kd": ppstats["kd"],
                                 "headshotPercentage": ppstats["hs"],
                                 "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
+                                "lastActive": format_last_active(ppstats.get("LastActiveEpoch")),
                             }
 
-                            # bar()
                     seen.append(player["Subject"])
             if (title := game_state_dict.get(game_state)) is None:
-                # program_exit(1)
                 time.sleep(9)
             
             title_parts = [f"VALORANT status: {title}"]
@@ -1096,6 +1296,7 @@ try:
                     table.set_runtime_col_flag("Party", False)
                     table.set_runtime_col_flag("Agent", False)
                     table.set_runtime_col_flag(cfg.weapon.capitalize(), False)
+                    table.set_runtime_col_flag("Last Active", False)
 
                 if game_state == "INGAME":
                     if isRange:
@@ -1119,9 +1320,7 @@ try:
                     if len(already_played_with) > 0:
                         print("\n")
                         for played in already_played_with:
-                            print(
-                                f"Already played with {played['name']} (last {played['agent']}) {stats.convert_time(played['time_diff'])} ago. (Total played {played['times']} times)"
-                            )
+                            print(stats.format_encounter_summary(played))
                 already_played_with = []
         if cfg.cooldown == 0:
             input("Press enter to fetch again...")
@@ -1136,7 +1335,7 @@ except:
     print(
         color(
             "The program has encountered an error. If the problem persists, please reach support"
-            f" with the logs found in {os.getcwd()}\\logs",
+            f" with the logs found in {os.path.join(PROJECT_ROOT, 'logs')}",
             fore=(255, 0, 0),
         )
     )

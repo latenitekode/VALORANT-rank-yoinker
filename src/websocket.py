@@ -5,7 +5,7 @@ import ssl
 import base64
 import json
 import asyncio
-from colr import color
+from src.colors import color
 
 class Ws:
     def __init__(self, lockfile, Requests, cfg, colors, hide_names, server, rpc=None):
@@ -31,6 +31,36 @@ class Ws:
     def set_player_data(self, player_data):
         self.player_data = player_data
 
+    def _state_from_presence_rows(self, rows):
+        candidates = []
+        for presence in rows or []:
+            if presence.get("puuid") != self.Requests.puuid:
+                continue
+            product = str(presence.get("product") or "").lower()
+            if product == "league_of_legends" or (product and product != "valorant"):
+                continue
+            try:
+                private_data = json.loads(base64.b64decode(presence.get("private", "")))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            state = None
+            if isinstance(private_data.get("matchPresenceData"), dict):
+                state = private_data.get("matchPresenceData", {}).get("sessionLoopState")
+            if not state:
+                state = private_data.get("sessionLoopState")
+            state = str(state or "").upper()
+            candidates.append((
+                state in ("MENUS", "PREGAME", "INGAME"),
+                int(presence.get("time") or 0),
+                state,
+                private_data,
+            ))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda row: (int(row[0]), row[1]), reverse=True)
+        _, _, state, private_data = candidates[0]
+        return state or None, private_data
+
     async def recconect_to_websocket(self, initial_game_state):
         local_headers = {
             'Authorization': 'Basic ' + base64.b64encode(('riot:' + self.lockfile['password']).encode()).decode()
@@ -48,10 +78,34 @@ class Ws:
                         await websocket.send('[5, "OnJsonApiEvent_chat_v6_messages"]')
                     
                     while True:
-                        response = await websocket.recv()
-                        result = self.handle(response, initial_game_state)
-                        if result is not None:
-                            return result
+                        try:
+                            response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            result = self.handle(response, initial_game_state)
+                            if result is not None:
+                                return result
+                        except asyncio.TimeoutError:
+                            # Websocket is the fast wake-up signal, not the only source of
+                            # truth. If Riot drops/coalesces an event, poll the local client
+                            # presence once per second so VRY cannot sit in the old state for
+                            # half a round waiting for another event. This is local-only.
+                            try:
+                                payload = await asyncio.to_thread(
+                                    self.Requests.fetch,
+                                    "local",
+                                    "/chat/v4/presences",
+                                    "get",
+                                )
+                                state, private_data = self._state_from_presence_rows(
+                                    (payload or {}).get("presences", [])
+                                )
+                                if state and state != initial_game_state:
+                                    if self.cfg.get_feature_flag("discord_rpc") and private_data:
+                                        self.rpc.set_rpc(private_data)
+                                    self.messages = 0
+                                    self.message_history = []
+                                    return state
+                            except Exception as e:
+                                self.log(f"Local presence fallback failed: {e}")
             except (websockets.exceptions.ConnectionClosed, websockets.exceptions.InvalidURI, websockets.exceptions.InvalidHandshake, ConnectionRefusedError, OSError) as e:
                 self.log(f"Websocket failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
@@ -76,37 +130,15 @@ class Ws:
             return None
 
         if resp_json[2].get("uri") == "/chat/v4/presences":
-            presence = resp_json[2].get("data", {}).get("presences", [{}])[0]
-            if presence.get('puuid') == self.Requests.puuid:
-                
-                if presence.get("product") == "league_of_legends":
-                    return None
-                
-                try:
-                    private_data = json.loads(base64.b64decode(presence['private']))
-                    
-                    # Temp fix: Riot is swapping between nested and flat API structures.
-                    state = None
-                    if "matchPresenceData" in private_data: # Check for nested structure
-                        state = private_data.get("matchPresenceData", {}).get("sessionLoopState")
-                    elif "sessionLoopState" in private_data: # Check for flattened structure
-                        state = private_data.get("sessionLoopState")
-                    else:
-                        # No known structure found, log and fail
-                        self.log(f"ERROR: Unknown presence API structure in 'websocket.handle': {private_data}")
-                        state = private_data["matchPresenceData"]["sessionLoopState"]
-
-                except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    self.log(f"Failed to decode private presence data: {e}")
-                    state = None
-
-                if state is not None:
-                    if self.cfg.get_feature_flag("discord_rpc") and private_data:
-                        self.rpc.set_rpc(private_data)
-                    if state != initial_game_state:
-                        self.messages = 0
-                        self.message_history = []
-                        return state
+            rows = resp_json[2].get("data", {}).get("presences", []) or []
+            state, private_data = self._state_from_presence_rows(rows)
+            if state:
+                if self.cfg.get_feature_flag("discord_rpc") and private_data:
+                    self.rpc.set_rpc(private_data)
+                if state != initial_game_state:
+                    self.messages = 0
+                    self.message_history = []
+                    return state
 
         elif resp_json[2].get("uri") == "/chat/v6/messages":
             message = resp_json[2].get("data", {}).get("messages", [{}])[0]

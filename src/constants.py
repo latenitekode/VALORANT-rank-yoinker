@@ -1,7 +1,9 @@
-import requests
-from colr import color
+from pathlib import Path
+from src.colors import color
 
-version = "2.94"
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+version = "2.99"
 enablePrivateLogging = True
 hide_names = True
 hide_levels = True
@@ -19,6 +21,7 @@ gamemodes = {
     "custom": "Custom",
     "snowball": "Snowball Fight",
     "valaram": "All Random One Site",
+    "dodgeball": "Knockout",
     "": "Custom",
 }
 
@@ -204,7 +207,8 @@ DEFAULT_CONFIG = {
         "headshot_percent": True,
         "winrate": True,
         "kd": False,
-        "level": True
+        "level": True,
+        "last_active": False
     },
     "flags": {
         "last_played": True,
@@ -217,6 +221,6 @@ DEFAULT_CONFIG = {
         "server_id": False,
         "short_ranks": False,
         "truncate_skins": True,
-        "truncate_names": True,
+        "truncate_names": True
     }
 }

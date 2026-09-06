@@ -34,8 +34,9 @@ class Rank:
             "statusgood": None,
             "statuscode": None,
             }
+        r = {}
         try:
-            if response.ok:
+            if response is not None and response.ok:
                 # self.log("retrieved rank successfully")
                 r = response.json()
                 rankTIER = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["CompetitiveTier"]
@@ -74,13 +75,16 @@ class Rank:
             final["rank"] = 0
             final["rr"] = 0
             final["leaderboard"] = 0
-        max_rank = final["rank"]
+        max_rank = final["rank"] or 0
         max_rank_season = seasonID
-        seasons = r["QueueSkills"]["competitive"].get("SeasonalInfoBySeasonID")
-        if seasons is not None:
-            for season in r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"]:
-                if r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][season]["WinsByTier"] is not None:
-                    for winByTier in r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][season]["WinsByTier"]:
+        seasons = (
+            ((r.get("QueueSkills") or {}).get("competitive") or {})
+            .get("SeasonalInfoBySeasonID") or {}
+        )
+        if seasons:
+            for season in seasons:
+                if seasons[season].get("WinsByTier") is not None:
+                    for winByTier in seasons[season].get("WinsByTier", {}):
                         if season in self.ranks_before:
                             if int(winByTier) > 20:
                                 winByTier = int(winByTier) + 3
@@ -107,8 +111,8 @@ class Rank:
 
         # rank.append(wr)
         final["wr"] = wr
-        final["statusgood"] = response.ok
-        final["statuscode"] = response.status_code
+        final["statusgood"] = bool(response is not None and response.ok)
+        final["statuscode"] = getattr(response, "status_code", 0)
         
 
         #peak rank act and ep

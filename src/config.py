@@ -4,7 +4,7 @@ from json import JSONDecodeError
 import requests
 import os
 
-from src.constants import DEFAULT_CONFIG
+from src.constants import DEFAULT_CONFIG, PROJECT_ROOT
 
 def apply_defaults(cls):
     for name, value in DEFAULT_CONFIG.items():
@@ -16,13 +16,13 @@ class Config:
     def __init__(self, log):
         self.log = log
 
-        if not os.path.exists("config.json"):
+        if not os.path.exists(os.path.join(PROJECT_ROOT, "config.json")):
             self.log("config.json not found, creating new one")
-            with open("config.json", "w") as file:
+            with open(os.path.join(PROJECT_ROOT, "config.json"), "w") as file:
                 config = self.config_dialog(file)
             
         try:
-            with open("config.json", "r") as file:
+            with open(os.path.join(PROJECT_ROOT, "config.json"), "r") as file:
                 self.log("config opened")
                 config = json.load(file)
 
@@ -32,7 +32,7 @@ class Config:
 
                 if len(missingkeys) > 0:
                     self.log("config.json is missing keys")
-                    with open("config.json", 'w') as w:
+                    with open(os.path.join(PROJECT_ROOT, "config.json"), 'w') as w:
                         self.log(f"missing keys: " + str(missingkeys))
                         for key in missingkeys:   
                             config[key] = DEFAULT_CONFIG[key]
@@ -42,7 +42,7 @@ class Config:
     
         except (JSONDecodeError):
             self.log("invalid file")
-            with open("config.json", "w") as file:
+            with open(os.path.join(PROJECT_ROOT, "config.json"), "w") as file:
                 config = self.config_dialog(file)
         finally:
             config = DEFAULT_CONFIG | config

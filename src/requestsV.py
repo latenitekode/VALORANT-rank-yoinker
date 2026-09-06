@@ -1,9 +1,10 @@
 import base64
 import json
 import time
+import threading
 from json.decoder import JSONDecodeError
 import requests
-from colr import color
+from src.colors import color
 import os
 import shutil
 import sys
@@ -11,6 +12,7 @@ import zipfile
 import io
 import subprocess
 from requests.exceptions import ConnectionError
+from src.constants import PROJECT_ROOT
 
 class Requests:
     def __init__(self, version, log, Error):
@@ -18,7 +20,7 @@ class Requests:
         self.version = version
         self.headers = {}
         self.log = log
-
+        self._thread_local = threading.local()
 
         self.lockfile = self.get_lockfile()
         self.region = self.get_region()
@@ -34,11 +36,25 @@ class Requests:
             self.get_lockfile(ignoreLockfile=True)
         
 
+
+    def _session(self):
+        """One requests.Session per worker thread for keep-alive connection reuse."""
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=8, pool_maxsize=8, max_retries=0
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self._thread_local.session = session
+        return session
+
     @staticmethod
     def check_version(version, copy_run_update_script):
         # checking for latest release
         try:
-            r = requests.get("https://api.github.com/repos/zayKenyon/VALORANT-rank-yoinker/releases")
+            r = requests.get("https://api.github.com/repos/mdevio/VALORANT-rank-yoinker/releases")
         except requests.exceptions.RequestException:
             print(color("[WARNING] Unable to check for updates - skipping...", fore=(255, 165, 0)))
             return
@@ -72,18 +88,18 @@ class Requests:
             os.mkdir(os.path.join(os.getenv('APPDATA'), "vry"))
         except FileExistsError:
             pass
-        shutil.copyfile("updatescript.bat", os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"))
+        shutil.copyfile(os.path.join(PROJECT_ROOT, "updatescript.bat"), os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"))
         r_zip = requests.get(link, stream=True)
         z = zipfile.ZipFile(io.BytesIO(r_zip.content))
         z.extractall(os.path.join(os.getenv('APPDATA'), "vry"))
-        subprocess.Popen([os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"), os.path.join(os.getenv('APPDATA'), "vry", ".".join(os.path.basename(link).split(".")[:-1])), os.getcwd(), os.path.join(os.getenv('APPDATA'), "vry")])
+        subprocess.Popen([os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"), os.path.join(os.getenv('APPDATA'), "vry", ".".join(os.path.basename(link).split(".")[:-1])), PROJECT_ROOT, os.path.join(os.getenv('APPDATA'), "vry")])
 
     @staticmethod
     def check_status():
         # checking status
         try:
             rStatus = requests.get(
-                "https://raw.githubusercontent.com/zayKenyon/VALORANT-rank-yoinker/main/status.json")
+                "https://raw.githubusercontent.com/mdevio/VALORANT-rank-yoinker/main/status.json")
         except requests.exceptions.RequestException:
             print(color("[WARNING] Unable to check status - skipping...", fore=(255, 165, 0)))
             return
@@ -98,92 +114,132 @@ class Requests:
             return
             
     def fetch(self, url_type: str, endpoint: str, method: str, rate_limit_seconds=5):
-        try:
-            if url_type == "glz":
-                response = requests.request(method, self.glz_url + endpoint, headers=self.get_headers(), verify=False)
-                self.log(f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
+        """Bounded Riot request wrapper.
 
-                if response.status_code == 404:
-                    return response.json()
+        Keeps VRY's historical return types (GLZ/local -> decoded JSON, PD ->
+        Response) while removing unbounded recursive retries and long sleeps.
+        This is especially important during PREGAME -> INGAME where one slow
+        player request used to hold the whole scoreboard.
+        """
+        method = str(method or "get").lower()
 
-                try:
-                    if response.json().get("errorCode") == "BAD_CLAIMS":
-                        self.log("detected bad claims")
-                        self.headers = {}
-                        return self.fetch(url_type, endpoint, method)
-                except JSONDecodeError:
-                    pass
-                if not response.ok:
-                    if response.status_code == 429:
-                        self.log("response not ok glz endpoint: rate limit 429")
-                    else:
-                        self.log("response not ok glz endpoint: " + response.text)
-                    time.sleep(rate_limit_seconds+5)
-                    self.headers = {}
-                    self.fetch(url_type, endpoint, method)
-                return response.json()
-            elif url_type == "pd":
-                response = requests.request(method, self.pd_url + endpoint, headers=self.get_headers(), verify=False)
-                self.log(
-                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
-                if response.status_code == 404:
-                    return response
+        def failed_response(status=599, body=b"{}"):
+            r = requests.Response()
+            r.status_code = int(status)
+            r._content = body
+            r.url = endpoint
+            return r
 
-                try:
-                    if response.json().get("errorCode") == "BAD_CLAIMS":
-                        self.log("detected bad claims")
-                        self.headers = {}
-                        return self.fetch(url_type, endpoint, method)
-                except JSONDecodeError:
-                    pass
+        if url_type == "glz":
+            url = self.glz_url + endpoint
+            timeout = (2.5, 7.0)
+        elif url_type == "pd":
+            url = self.pd_url + endpoint
+            timeout = (2.5, 7.0)
+        elif url_type == "local":
+            url = f"https://127.0.0.1:{self.lockfile['port']}{endpoint}"
+            timeout = (0.8, 2.0)
+        elif url_type == "custom":
+            url = endpoint
+            timeout = (2.5, 7.0)
+        else:
+            raise ValueError(f"Unknown url_type: {url_type}")
 
-                if not response.ok:
-                    if response.status_code == 429:
-                        self.log(f"response not ok pd endpoint, rate limit 429")
-                    else:
-                        self.log(f"response not ok pd endpoint, {response.text}")
-                    time.sleep(rate_limit_seconds+5)
-                    self.headers = {}
-                    return self.fetch(url_type, endpoint, method, rate_limit_seconds=rate_limit_seconds+5)
-                return response
-            elif url_type == "local":
-                local_headers = {'Authorization': 'Basic ' + base64.b64encode(
-                    ('riot:' + self.lockfile['password']).encode()).decode()}
-                
-                max_retries = 3
-                for i in range(max_retries):
+        auth_refreshed = False
+        max_attempts = 3 if url_type == "local" else 2
+        last_response = None
+
+        for attempt in range(max_attempts):
+            try:
+                if url_type == "local":
+                    local_headers = {
+                        'Authorization': 'Basic ' + base64.b64encode(
+                            ('riot:' + self.lockfile['password']).encode()
+                        ).decode()
+                    }
+                    headers = local_headers
+                else:
+                    headers = self.get_headers()
+
+                response = self._session().request(
+                    method, url, headers=headers, verify=False, timeout=timeout
+                )
+                last_response = response
+                if endpoint != "/chat/v4/presences":
+                    self.log(
+                        f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
+                        f" response code: {response.status_code}"
+                    )
+
+                if url_type == "local":
                     try:
-                        response = requests.request(method, f"https://127.0.0.1:{self.lockfile['port']}{endpoint}",
-                                                    headers=local_headers,
-                                                    verify=False, timeout=5)
-                        if response.status_code == 200 and response.json().get("errorCode") != "RPC_ERROR":
-                            if endpoint != "/chat/v4/presences":
-                                self.log(
-                                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                                    f" response code: {response.status_code}")
-                            return response.json()
-                        else:
-                            self.log(f"Local API is not ready yet (RPC_ERROR or status code {response.status_code}). Retrying...")
-                            time.sleep(5)
-                    except (requests.exceptions.RequestException, ConnectionError):
-                        self.log(f"Connection error on local request. Retrying... ({i + 1}/{max_retries})")
-                        time.sleep(5)
-                
-                self.log(f"Failed to connect to local client after {max_retries} attempts.")
-                return None
-            elif url_type == "custom":
-                response = requests.request(method, f"{endpoint}", headers=self.get_headers(), verify=False)
+                        data = response.json()
+                    except JSONDecodeError:
+                        data = None
+                    if response.status_code == 200 and not (
+                        isinstance(data, dict) and data.get("errorCode") == "RPC_ERROR"
+                    ):
+                        return data
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.12 * (attempt + 1))
+                        continue
+                    return None
+
+                try:
+                    data = response.json()
+                except JSONDecodeError:
+                    data = None
+
+                if isinstance(data, dict) and data.get("errorCode") == "BAD_CLAIMS" and not auth_refreshed:
+                    self.log("detected bad claims; refreshing Riot auth once")
+                    self.headers = {}
+                    auth_refreshed = True
+                    continue
+
+                # Membership endpoints use 400/404 as normal "not in this phase"
+                # signals. Return them immediately rather than sleeping/retrying.
+                if response.status_code in (400, 404):
+                    if url_type == "pd":
+                        return response
+                    return data if isinstance(data, dict) else {"errorCode": "RESOURCE_NOT_FOUND"}
+
+                if response.ok:
+                    if url_type == "pd":
+                        return response
+                    return data
+
+                if response.status_code == 429 or 500 <= response.status_code <= 504:
+                    if attempt < max_attempts - 1:
+                        retry_after = response.headers.get("Retry-After", "")
+                        try:
+                            wait = min(2.0, max(0.25, float(retry_after)))
+                        except (TypeError, ValueError):
+                            wait = 0.35 * (attempt + 1)
+                        self.log(
+                            f"transient Riot {response.status_code}; bounded retry in {wait:.2f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+
+                self.log(f"response not ok {url_type} endpoint: {response.text[:500]}")
+                if url_type == "pd":
+                    return response
+                return data if isinstance(data, dict) else {"errorCode": "REQUEST_FAILED"}
+
+            except (requests.exceptions.RequestException, ConnectionError) as exc:
                 self.log(
-                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
-                if not response.ok: self.headers = {}
-                return response.json()
-        except json.decoder.JSONDecodeError:
-            self.log(f"JSONDecodeError in fetch function, resp.code: {response.status_code}, resp_text: '{response.text}")
-            print(response)
-            print(response.text)
+                    f"request error: url_type={url_type}, endpoint={endpoint}, "
+                    f"attempt={attempt + 1}/{max_attempts}: {exc}"
+                )
+                if attempt < max_attempts - 1:
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+
+        if url_type == "pd":
+            return last_response if last_response is not None else failed_response()
+        if url_type == "local":
+            return None
+        return {"errorCode": "REQUEST_FAILED"}
 
     def get_region(self):
         path = os.path.join(os.getenv('LOCALAPPDATA'), R'VALORANT\Saved\Logs\ShooterGame.log')

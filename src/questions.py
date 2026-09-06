@@ -11,13 +11,14 @@ TABLE_OPTS = {
     "headshot_percent": "Headshot Percentage",
     "winrate": "WinRate",
     "kd": "K/D Ratio <!> Last Game Only <!>",
-    "level": "Account Level"
+    "level": "Account Level",
+    "last_active": "Last Competitive Activity"
 }
 
 FLAGS_OPTS = {
 	"last_played": "Last Played Stats",
 	"auto_hide_leaderboard": "Auto Hide Leaderboard Column",
-    "pre_cls": "Pre-Clear Screen",
+    "pre_cls": "Pre-Clear Screen on each game update.",
     "game_chat": "Print Game Chat",
     "peak_rank_act": "Peak Rank Act",
     "discord_rpc": "Discord Rich Presence",
@@ -26,7 +27,6 @@ FLAGS_OPTS = {
     "short_ranks": "Short rank names instead of long ones",
     "truncate_skins": "Truncate long skin names if the window is too small",
     "truncate_names": "Truncate long player names if the window is too small",
-
 }
 
 weapon_question = lambda config: {

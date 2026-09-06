@@ -1,8 +1,9 @@
 import json
 import logging
+import os
 from websocket_server import WebsocketServer
 
-from src.constants import version
+from src.constants import version, PROJECT_ROOT
 
 logging.getLogger('websocket_server.websocket_server').disabled = True
 
@@ -17,7 +18,7 @@ class Server:
     def start_server(self):
         try:
             # print(self.lastMessage)
-            with open("config.json", "r") as conf:
+            with open(os.path.join(PROJECT_ROOT, "config.json"), "r") as conf:
                 port = json.load(conf)["port"]
             self.server = WebsocketServer(host="0.0.0.0", port=port)
             # server = websocket.WebSocketApp("wss://localhost:1100", on_open=on_open, on_message=on_message, on_close=on_close)
