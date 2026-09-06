@@ -3,7 +3,7 @@ from src.colors import color
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-version = "2.99"
+version = "3.00"
 enablePrivateLogging = True
 hide_names = True
 hide_levels = True
@@ -86,7 +86,7 @@ AGENTCOLORLIST = {
     "miks": (250, 203, 115),
 }
 
-symbol = "■"
+symbol = "â– "
 PARTYICONLIST = [
     color(symbol, fore=(227, 67, 67)),
     color(symbol, fore=(216, 67, 227)),
