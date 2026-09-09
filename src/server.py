@@ -59,7 +59,10 @@ class Server:
             name="vry-docs-server",
             daemon=True,
         ).start()
-        self.log(f"tracker UI available at {self.get_match_loadouts_url(websocket_port)}")
+
+        browser_url = self.get_match_loadouts_url(websocket_port)
+        os.environ["VRY_TRACKER_URL"] = browser_url
+        self.log(f"tracker UI available at {browser_url}")
 
     def get_match_loadouts_url(self, websocket_port):
         if self.docs_port is not None:
