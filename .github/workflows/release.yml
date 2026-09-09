@@ -55,7 +55,10 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+
+          if ($releaseExists) {
             "exists=true" >> $env:GITHUB_OUTPUT
             Write-Host "Release $env:VERSION already exists; nothing to publish."
           } else {
