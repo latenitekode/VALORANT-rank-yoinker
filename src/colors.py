@@ -1,10 +1,27 @@
+import os
 import re
 from rich.console import Console
 from rich.text import Text
 
 _console = Console(force_terminal=True, color_system="truecolor", width=1000)
 
+
+def _rewrite_tracker_link(text):
+    """Replace only the bundled tracker file URI inside OSC-8 links with localhost HTTP."""
+    tracker_url = os.environ.get("VRY_TRACKER_URL")
+    if not tracker_url:
+        return str(text)
+
+    return re.sub(
+        r"file://[^\x1b]*?/docs/matchLoadouts\.html",
+        tracker_url,
+        str(text),
+        flags=re.IGNORECASE,
+    )
+
+
 def color(text, fore=None):
+    text = _rewrite_tracker_link(text)
     if fore is None:
         return str(text)
     
