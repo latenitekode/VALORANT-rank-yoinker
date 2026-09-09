@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - Build
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the exact built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $constants = Get-Content "src/constants.py" -Raw
+          if ($constants -notmatch 'version\s*=\s*["'']([^"'']+)["'']') {
+            throw "Could not read version from src/constants.py"
+          }
+
+          $version = $Matches[1]
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Version '$version' is not valid semantic versioning (for example: 3.0.1)."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Release version: $version"
+
+      - name: Check whether this version is already released
+        id: existing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Release $env:VERSION already exists; nothing to publish."
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Release $env:VERSION does not exist yet."
+          }
+
+      - name: Download the successful Windows build
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          $short = $env:HEAD_SHA.Substring(0, 7)
+          $artifact = "VALORANT-rank-yoinker-$short"
+          Write-Host "Downloading artifact: $artifact"
+
+          gh run download $env:RUN_ID `
+            --repo $env:GITHUB_REPOSITORY `
+            --name $artifact `
+            --dir release-root
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to download build artifact '$artifact'."
+          }
+
+      - name: Package release files
+        if: steps.existing.outputs.exists != 'true'
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if (-not (Test-Path "release-root/vry.exe")) {
+            throw "Downloaded artifact does not contain vry.exe at its root."
+          }
+
+          Set-Content -Path "release-root/VERSION.txt" -Value $env:VERSION -NoNewline
+
+          $zip = "VALORANT-rank-yoinker-$env:VERSION-Windows-x64.zip"
+          $checksum = "$zip.sha256.txt"
+
+          Compress-Archive -Path "release-root/*" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zip" | Set-Content -Path $checksum -Encoding ascii
+
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          gh release create $env:VERSION `
+            $env:ZIP `
+            $env:CHECKSUM `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:HEAD_SHA `
+            --title $env:VERSION `
+            --generate-notes
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release creation failed."
+          }
